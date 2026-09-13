@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .vram_estimate import DEFAULT_SAFETY_BYTES, clamp_safety_bytes
+
 __all__ = [
     "ConfigStore",
     "resolve_config_root",
@@ -195,6 +197,10 @@ class Settings:
 
     theme 字段取值见模块级 THEME_CHOICES；默认深色。主题与参数预设分开存储——
     主题走 settings.json，参数走 presets/ 目录下的文件，互不干扰。
+
+    weight_bytes_cache 是「模型文件路径 → 权重 H2D 实测字节」的缓存（见
+    core/weight_cache.py）：ninfer-serve 首次成功启动后由日志行解析回填，显存
+    预检（core/vram_preflight）对同一模型改用实测权重字节而非标定默认值。
     """
     last_preset: str = ""
     window_width: int = 1100
@@ -203,6 +209,25 @@ class Settings:
     exe_path: str = ""
     params: dict[str, Any] = field(default_factory=dict)
     theme: str = THEME_DARK
+    weight_bytes_cache: dict[str, int] = field(default_factory=dict)
+    #: 显存预检安全垫字节（用户在预检面板上可调，范围 [SAFETY_MIN_BYTES, SAFETY_MAX_BYTES]）。
+    #: 默认取 DEFAULT_SAFETY_BYTES（200 MiB）。读入时夹紧到合法范围。
+    safety_bytes: int = DEFAULT_SAFETY_BYTES
+
+
+def _norm_weight_cache(value: Any) -> dict[str, int]:
+    """把读出来的 weight_bytes_cache 归一成 dict[str, int]。
+
+    老版本 settings.json 没有该字段、或字段被改坏（非 dict / 值非正整数）时
+    一律安全回落：非 dict 返回空 dict，dict 里只保留 路径→正整 数 的条目。
+    """
+    if not isinstance(value, dict):
+        return {}
+    cache: dict[str, int] = {}
+    for key, item in value.items():
+        if isinstance(key, str) and isinstance(item, int) and not isinstance(item, bool) and item > 0:
+            cache[key] = item
+    return cache
 
 
 def _norm_theme(value: Any) -> str:
@@ -232,6 +257,8 @@ def load_settings(root: Path) -> Settings:
             exe_path=data.get("exe_path", ""),
             params=data.get("params", {}),
             theme=_norm_theme(data.get("theme", THEME_DARK)),
+            weight_bytes_cache=_norm_weight_cache(data.get("weight_bytes_cache", {})),
+            safety_bytes=clamp_safety_bytes(data.get("safety_bytes", DEFAULT_SAFETY_BYTES)),
         )
     except (json.JSONDecodeError, OSError, ValueError):
         return Settings()
@@ -249,6 +276,8 @@ def save_settings(root: Path, settings: Settings) -> None:
         "exe_path": settings.exe_path,
         "params": settings.params,
         "theme": settings.theme,
+        "weight_bytes_cache": settings.weight_bytes_cache,
+        "safety_bytes": settings.safety_bytes,
     }
     text = json.dumps(data, ensure_ascii=False, indent=2)
     tmp = path.with_suffix(".tmp")

@@ -44,6 +44,7 @@ __all__ = [
     "process_terminated",
     "VramSettleWatcher",
     "settle_vram",
+    "stop_external_sync",
 ]
 
 TERMINATE_GRACE_SECONDS = 5.0
@@ -521,5 +522,62 @@ def settle_vram(
         if result.done:
             return result
         sleep(watcher.next_delay())
+
+
+def stop_external_sync(
+    pid: int,
+    *,
+    killer: Callable[[int], tuple[bool, str]] = run_taskkill,
+    hard_terminator: Callable[[int], tuple[bool, str]] = terminate_process_hard,
+    terminated_check: Callable[[int | None], bool] = process_terminated,
+    kill_escalation: float = KILL_ESCALATION_SECONDS,
+    kill_check_interval_ms: int = KILL_CHECK_INTERVAL_MS,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    on_message: Callable[[str], None] | None = None,
+) -> bool:
+    """按 PID 同步停止外部实例（CLI / 外部拉起、无 QProcess 句柄），返回 True=已确认死亡。
+
+    升级链与 ExternalProcessStopper 完全一致，仅把 QTimer 轮询换成阻塞 sleep：
+    1. 进程已不在运行 → 直接返回 True（不发任何杀命令）；
+    2. taskkill 杀进程树；
+    3. 仍存活（CUDA 驱动态常见）→ 每 kill_check_interval_ms 重发 Win32 强杀，
+       以 OS 层真值（terminated_check）校验，直到进程真死或 kill_escalation 用尽。
+
+    供 closeEvent 等「必须同步等到进程消失才能继续」的路径使用（GUI 窗口关闭后
+    事件循环即销毁，异步 stopper 的 QTimer 不再有 tick 机会）。显存回落等待刻意
+    省略——窗口即将销毁，无需再等显存曲线回落；若时限用尽仍未杀死，调用方应据
+    False 返回值给出显著警告。全部 I/O 可注入，测试用假件替换后不碰真实进程。
+    """
+    if not pid:
+        return False
+    if on_message is None:
+        on_message = lambda _text: None
+    if terminated_check(pid):
+        on_message(f"进程（PID {pid}）已不在运行，无需停止")
+        return True
+    on_message(f"正在停止外部服务（PID {pid}）…")
+    ok, detail = killer(pid)
+    on_message(detail)
+    if terminated_check(pid):
+        return True
+    deadline = clock() + kill_escalation
+    on_message(
+        f"taskkill 之后进程仍存活（GPU 驱动态常见），升级强杀并等待 OS 确认"
+        f"（最多 {kill_escalation:.0f} 秒）…"
+    )
+    interval = max(0.001, kill_check_interval_ms / 1000.0)
+    while True:
+        if terminated_check(pid):
+            return True
+        if clock() >= deadline:
+            on_message(
+                f"⚠ {kill_escalation:.0f} 秒强杀后服务进程（PID {pid}）仍未退出："
+                "请在任务管理器中手动结束它，该进程仍会占用 GPU 显存"
+            )
+            return False
+        sleep(interval)
+        ok, detail = hard_terminator(pid)
+        on_message(detail)
 
 

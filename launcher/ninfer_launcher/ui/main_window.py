@@ -44,9 +44,26 @@ from ..core.process import (
     LogSource,
     ServerProcess,
     ServerState,
+    stop_external_sync,
 )
 from ..core.service_status import observe_service_state
 from ..core.monitor import MonitorService, make_vram_reader
+from ..core.vram_estimate import (
+    DEFAULT_KV_DTYPE,
+    DEFAULT_MAX_CONTEXT,
+    VramConfig,
+    config_from_values,
+    estimate_requirement,
+)
+from ..core.vram_preflight import (
+    PREFLIGHT_INTERVAL_MS,
+    PREFLIGHT_PARAM_DEBOUNCE_MS,
+    PreflightStatus,
+    PreflightVerdict,
+    evaluate,
+)
+from ..core.gpu_processes import list_gpu_processes
+from ..core.weight_cache import parse_weight_bytes_from_log, update_weight_cache
 from ..params.builder import build, build_command
 from ..params.registry import default_values, validate_values
 from ..params.spec import Bool3
@@ -98,8 +115,9 @@ class MainWindow(QMainWindow):
             self.resize(self._settings.window_width, self._settings.window_height)
 
         # 核心服务（monitor 实例同时供控制面板监视面板、进程层显存回落、外部服务停止
-        # 的显存回落等待复用——同一读数来源，避免多开 NVML 句柄）
-        monitor = MonitorService()
+        # 的显存回落等待、显存预检复用——同一读数来源，避免多开 NVML 句柄）
+        self._monitor = MonitorService()
+        monitor = self._monitor
         self._vram_reader = make_vram_reader(monitor)
         self._process = ServerProcess(vram_reader=self._vram_reader)
         self._health = HealthPoller(abort_check=self._process.abort_reason)
@@ -175,6 +193,32 @@ class MainWindow(QMainWindow):
         self._ext_timer.timeout.connect(self._reconcile_external_service)
         self._ext_timer.start()
 
+        # 显存预检（docs/02-vram-preflight-design.md）：每 2 秒用「当前参数配置 → 需求估算」
+        # 对「NVML 实时空余」重算一次，不足时门控「启动」按钮（ControlPanel.set_preflight_blocked）；
+        # 参数 / 模型变化另走 150ms 去抖立即重算。NVML 句柄复用 self._monitor（nvml_module
+        # 访问器）；读不到显存时降级为告警、不阻断启动（PreflightStatus.UNAVAILABLE）。
+        self._preflight_verdict: PreflightVerdict | None = None
+        self._preflight_unavailable_logged = False
+        self._started_model_path: str | None = None  # 本次启动用的模型文件（日志权重解析归属）
+        self._preflight_timer = QTimer(self)
+        self._preflight_timer.setInterval(PREFLIGHT_INTERVAL_MS)
+        self._preflight_timer.timeout.connect(self._run_preflight_and_apply)
+        self._preflight_timer.start()
+        # 参数变化重算的去抖定时器：单次触发、可重启。每次 valueChanged 调 .start() 重置
+        # 计时（丢弃上一次挂起的触发），连续拖动 spinbox 只在最后一次变化后 150ms 真正
+        # 重算一次——避免用 singleShot 各起独立定时器导致的「一串冗余 NVML 查询」。
+        self._preflight_debounce = QTimer(self)
+        self._preflight_debounce.setSingleShot(True)
+        self._preflight_debounce.setInterval(PREFLIGHT_PARAM_DEBOUNCE_MS)
+        self._preflight_debounce.timeout.connect(self._run_preflight_and_apply)
+        _preflight_panel = self._control.get_preflight_panel()
+        _preflight_panel.refresh_requested.connect(self._run_preflight_and_apply)
+        # 安全垫：从 settings 初始化面板 SpinBox（set 期间屏蔽信号，不触发重算），
+        # 之后用户改动经 safety_changed 落盘 + 立即重算。
+        _preflight_panel.set_safety_bytes(self._settings.safety_bytes)
+        _preflight_panel.safety_changed.connect(self._on_safety_changed)
+        self._params.store.valueChanged.connect(self._on_param_value_changed)
+
         # 预设组信号
         preset_group = self._control.get_preset_group()
         preset_group.presetSelected.connect(self._on_preset_selected)
@@ -203,6 +247,10 @@ class MainWindow(QMainWindow):
         # messageReady 落到日志区。
         self._gpu_switch.turn_off()
 
+        # 首次预检延迟到事件循环第一轮：构造期同步 poll 会在无事件循环的测试里触真实
+        # 监控路径；生产环境窗口一显示即完成首轮判定（按钮门控与面板即刻就位）。
+        QTimer.singleShot(0, self._run_preflight_and_apply)
+
     # -- 信号槽：进程 / 健康 --
 
     def _on_state_changed(self, state) -> None:
@@ -218,9 +266,13 @@ class MainWindow(QMainWindow):
         # 面板切到进程状态）。回到停止态后，下一轮对账会重新识别仍存活的外部服务。
         if self._external_state is not None and not self._external_stop_in_progress:
             self._clear_external_observation()
+        # 进程状态变化会改变预检语义（运行中 → RUNNING 中性态；停止 → 恢复冷启动评估），
+        # 立即重算一轮，面板无需等下一次周期定时器（最多 2 秒）才切换。
+        self._run_preflight_and_apply()
 
     def _on_log_line(self, line) -> None:
         self._log.append_line(line)
+        self._maybe_record_weight_bytes(line)
 
     def _on_gpu_power_message(self, lines) -> None:
         """性能模式开关读/写驱动的结果落日志区（开关已把成功/失败原因说清）。"""
@@ -228,6 +280,9 @@ class MainWindow(QMainWindow):
             self._log.append_line(LogLine(LogSource.LAUNCHER, text))
 
     def _on_exited(self, info) -> None:
+        # 进程已退：本次启动的模型归属失效，后续日志行不再往权重缓存里记（服务再跑时
+        # _on_start 会重新设置）。
+        self._started_model_path = None
         if info.unexpected:
             self._log.append_line(LogLine(LogSource.LAUNCHER, "进程异常退出！"))
         # 服务退出（被停止 / 崩溃 / 探通前退出）时关闭性能模式，无需使用者手动清理。
@@ -239,6 +294,132 @@ class MainWindow(QMainWindow):
     def _on_health_aborted(self, reason: str) -> None:
         if self._process.state is ServerState.STARTING:
             self._process.mark_ready()
+
+    # -- 显存预检（门控「启动」按钮，docs/02-vram-preflight-design.md） --
+
+    def _preflight_config(self) -> VramConfig:
+        """从当前参数抽取预检配置；任何异常回落默认配置（预检永不因参数问题中断）。"""
+        try:
+            values = self._params.get_values()
+            model = self._control.get_model_path() or ""
+            return config_from_values(
+                values,
+                weight_bytes=self._weight_bytes_for(model),
+                safety_bytes=self._settings.safety_bytes,
+            )
+        except Exception:  # noqa: BLE001
+            return VramConfig(
+                DEFAULT_MAX_CONTEXT, DEFAULT_KV_DTYPE, "mtp", False,
+                safety_bytes=self._settings.safety_bytes,
+            )
+
+    def _weight_bytes_for(self, model_path: str) -> int | None:
+        """取模型的权重字节：优先 settings.weight_bytes_cache 的实测值，未命中返回 None
+        （估算侧回落到 vram_estimate.DEFAULT_WEIGHT_BYTES）。"""
+        if not model_path:
+            return None
+        return self._settings.weight_bytes_cache.get(model_path)
+
+    def _unavailable_verdict(self, reason: str) -> PreflightVerdict:
+        """读数失败时的降级结论：UNAVAILABLE 不阻断启动（风险自负）。"""
+        requirement = estimate_requirement(self._preflight_config())
+        return PreflightVerdict(
+            PreflightStatus.UNAVAILABLE, requirement, None, None, 0, (), (reason,)
+        )
+
+    def _run_preflight(self) -> PreflightVerdict:
+        """算一次预检判定：读现状（MonitorService 快照 + NVML 进程枚举）+ 估需求。
+
+        永不抛异常：任何一步失败都收敛为 UNAVAILABLE 结论，绝不把异常抛回事件循环。
+        """
+        try:
+            config = self._preflight_config()
+            snapshot = self._monitor.poll()
+            gpu = snapshot.gpu_by_index(0)
+        except Exception:  # noqa: BLE001
+            return self._unavailable_verdict("显存状态读取失败，未做预检（启动风险自负）")
+        try:
+            # psutil 注入位：MonitorService 协议上的可选 psutil_module（测试用假件），
+            # 未提供时 list_gpu_processes 自动 import 真实 psutil（生产路径不变）。
+            processes = list_gpu_processes(
+                nvml_module=self._monitor.nvml_module,
+                psutil_module=getattr(self._monitor, "psutil_module", None),
+            )
+        except Exception:  # noqa: BLE001
+            processes = ()
+        return evaluate(config, gpu, processes, server_running=self._server_running())
+
+    def _server_running(self) -> bool:
+        """目标服务是否已在运行：自身进程非停止态，或已观测到外部实例在运行 / 启动中。
+
+        服务在跑时预检「冷启动能否装下」无意义（当前显存占用已含本服务），evaluate 会
+        据此返回 RUNNING 中性结论，不再拿空余减需求误报「显存不足」。
+        """
+        if self._process.state is not ServerState.STOPPED:
+            return True
+        return self._external_state in (ServerState.RUNNING, ServerState.STARTING)
+
+    def _run_preflight_and_apply(self) -> PreflightVerdict:
+        """重算预检并落地：门控「启动」按钮 + 刷新预检面板 + 首次降级告警落日志。"""
+        verdict = self._run_preflight()
+        self._preflight_verdict = verdict
+        # 预检不再硬门控启动（can_start 恒为 True）：显存不足仅在面板红色警告，
+        # 是否启动交给用户。这里仍调 set_preflight_blocked 以保持接口一致（恒不阻断）。
+        self._control.set_preflight_blocked(not verdict.can_start, "")
+        self._control.get_preflight_panel().apply_verdict(verdict)
+        if (
+            verdict.status is PreflightStatus.UNAVAILABLE
+            and not self._preflight_unavailable_logged
+        ):
+            self._preflight_unavailable_logged = True
+            self._log.append_line(
+                LogLine(LogSource.LAUNCHER, "无法读取 GPU 显存占用，未做显存预检（启动风险自负）")
+            )
+        return verdict
+
+    def _format_preflight_message(self, verdict: PreflightVerdict) -> str:
+        """把预检结论的说明文案拼成对话框 / tooltip 用的多行文本。"""
+        return "\n".join(verdict.messages) or "显存不足"
+
+    def _on_param_value_changed(self, key: str, value: object) -> None:
+        """参数值变化（上下文 / KV 精度 / MTP / 视觉 / 模型）会改变显存需求：
+        重启去抖定时器，spinbox 连续拖动只在稳定 150ms 后真正重算一次预检。"""
+        self._preflight_debounce.start()
+
+    def _on_safety_changed(self, safety_bytes: int) -> None:
+        """安全垫被用户改动：落盘 settings.json + 去抖重算预检。
+
+        值已在面板侧夹紧到 [SAFETY_MIN_BYTES, SAFETY_MAX_BYTES]；仅在真正变化时写盘，
+        避免无谓 IO。重算走同一去抖定时器，连续点 SpinBox 只在稳定后算一次。
+        """
+        if safety_bytes == self._settings.safety_bytes:
+            return
+        self._settings.safety_bytes = safety_bytes
+        self._store.save_settings(self._settings)
+        self._preflight_debounce.start()
+
+    def _maybe_record_weight_bytes(self, line) -> None:
+        """从服务器日志的权重加载 100% 行解析实测权重显存，写缓存并落盘 settings.json。
+
+        归属到「本次启动的模型」（_started_model_path），避免模型下拉框被改动后
+        把实测值记到错误的模型名下。首次运行（无缓存）时预检用标定值兜底。
+        """
+        if line.source is LogSource.LAUNCHER:
+            return
+        weight = parse_weight_bytes_from_log(line.text)
+        if weight is None:
+            return
+        model = self._started_model_path or self._control.get_model_path() or ""
+        if not model:
+            return
+        if update_weight_cache(self._settings.weight_bytes_cache, model, weight):
+            self._store.save_settings(self._settings)
+            self._log.append_line(
+                LogLine(
+                    LogSource.LAUNCHER,
+                    f"已记录 {os.path.basename(model)} 权重显存实测 {weight / (1024 ** 3):.2f} GiB（后续预检采用）",
+                )
+            )
 
     # -- 信号槽：控制板 --
 
@@ -266,6 +447,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "启动前校验失败", "\n".join(errors))
             return
 
+        # 显存预检（docs/02-vram-preflight-design.md）：重算一轮刷新面板警告。预检只做
+        # 知情提示、不再阻断启动——显存不足仅在预检面板红色警告，是否启动交由用户决定
+        # （需求估算含保守安全余量，临界不足未必真跑不动）。
+        self._run_preflight_and_apply()
+
         try:
             args = build(values)
         except ValueError as exc:
@@ -278,6 +464,8 @@ class MainWindow(QMainWindow):
                 f"未找到 ninfer-serve.exe\n当前路径：{exe}")
             return
 
+        # 记下本次启动的模型：日志权重 100% 行的实测值按它归属进 weight_bytes_cache。
+        self._started_model_path = values["model"]
         self._process.start(exe, args)
         self._preset_snapshot = self._params.get_values()
 
@@ -412,6 +600,41 @@ class MainWindow(QMainWindow):
             self._gpu_switch.turn_off()
         # ok=False（升级时限用尽仍存活）：不清观测——服务大概率仍在跑，下一轮对账会
         # 重新识别并保持按钮可操作，用户可重试停止或在任务管理器手动结束。
+
+    def _stop_external_blocking(self) -> None:
+        """关闭路径的外部实例同步停止（docs/03-close-external-service-leak-fix.md）。
+
+        ExternalProcessStopper 是 QTimer 驱动的异步流程，窗口一旦放行关闭、事件循环
+        收尾后它的 tick 便不再有机会执行；因此 closeEvent 走纯同步的
+        stop_external_sync（与 CLI action_stop / ExternalProcessStopper 同源的升级链：
+        taskkill → Win32 强杀 + OS 真值校验），确认进程死亡后才继续收尾。无 PID
+        登记表时无法定位进程，只落提示日志、不阻断关闭（与 _stop_external 一致）。
+        """
+        pid = self._external_pid
+        if not pid:
+            self._log.append_line(
+                LogLine(
+                    LogSource.LAUNCHER,
+                    "外部服务在运行但无法定位其进程（无 PID 登记表），"
+                    "请在任务管理器 → 详细信息中结束占用该端口的进程",
+                )
+            )
+            return
+        owner = self._external_owner or "未知"
+        self._log.append_line(
+            LogLine(LogSource.LAUNCHER, f"正在停止外部服务（PID {pid}，归属 {owner}）…")
+        )
+        ok = stop_external_sync(pid, on_message=self._on_external_stop_message)
+        if not ok:
+            # 升级时限用尽仍存活：给出显著警告后照常放行关闭（宁可带警告退出，
+            # 也不静默残留占着显存的进程）。
+            self._log.append_line(
+                LogLine(
+                    LogSource.LAUNCHER,
+                    f"⚠ 外部服务进程（PID {pid}）在时限内未能杀死，将带着它退出，"
+                    "请在任务管理器中手动结束——它仍会占用显存",
+                )
+            )
 
     # -- 显示命令 --
 
@@ -713,7 +936,17 @@ class MainWindow(QMainWindow):
         # 可能在驱动态长期拒绝终止，状态机 / Qt 缓存也可能与 OS 实况脱节——只要进程
         # 实际还活着，就必须走完整停止流程（terminate→taskkill→强杀升级+OS 校验），
         # 绝不让启动器退出时把 ninfer-serve 残留下来。
-        if self._process.state.active or self._process.is_alive():
+        self_active = self._process.state.active or self._process.is_alive()
+        # 外部服务（CLI / 外部拉起、本 GUI 无 QProcess 句柄）同样纳入关闭判定：
+        # 面板显示它在运行 / 加载中，或异步停止正在进行（_external_stopper 存活），
+        # 都必须先停掉再放行——否则关窗会把外部 ninfer-serve 彻底遗弃（2026-09 实测
+        # 残留 ~23 GB 显存，见 docs/03-close-external-service-leak-fix.md）。
+        external_active = (
+            self._external_state in (ServerState.RUNNING, ServerState.STARTING)
+            or self._external_stop_in_progress
+            or self._external_stopper is not None
+        )
+        if self_active or external_active:
             reply = QMessageBox.question(
                 self, "确认退出",
                 "服务器正在运行，退出将停止它。确定吗？",
@@ -723,7 +956,20 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.StandardButton.No:  # 用 == 比较：PySide6 的 question 真实返回 int，is 比较永远不成立
                 event.ignore()
                 return
-            self._process.stop_and_wait()
+            # 自身进程：走既有同步升级链（terminate → taskkill → 强杀升级 + OS 校验）
+            if self_active:
+                self._process.stop_and_wait()
+            # 外部实例：若已有异步停止在进行，先掐掉它的定时器避免与同步停止竞争，
+            # 再按 PID 走一次同步升级链收敛到 OS 真值（同一进程只会被一套流程处理）。
+            if external_active:
+                stopper = self._external_stopper
+                if stopper is not None:
+                    stopper._kill_timer.stop()
+                    stopper._settle_timer.stop()
+                    stopper.deleteLater()
+                    self._external_stopper = None
+                self._external_stop_in_progress = False
+                self._stop_external_blocking()
 
         geo = self.geometry()
         self._settings.window_width = geo.width()
@@ -732,5 +978,8 @@ class MainWindow(QMainWindow):
         # 关闭启动器时也关闭性能模式（服务器若刚经 stop_and_wait 退出，_on_exited 已关过，
         # 这里再关一次是安全的空写，覆盖「服务器本就已停、性能模式却被手动开着」的情形）。
         self._gpu_switch.turn_off()
+        # 预检定时器（周期 + 去抖）随窗口一起停（避免关闭收尾期间再触发一轮 NVML 读数）。
+        self._preflight_timer.stop()
+        self._preflight_debounce.stop()
         self._control.shutdown()
         event.accept()

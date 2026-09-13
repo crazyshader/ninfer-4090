@@ -29,9 +29,10 @@ SMI_ONE_GPU = b"0, NVIDIA GeForce RTX 4090, 20480, 24576, 2520, 55, 180.00, 450.
 
 
 class _MemInfo:
-    def __init__(self, used: int, total: int) -> None:
+    def __init__(self, used: int, total: int, reserved: int = 0) -> None:
         self.used = used
         self.total = total
+        self.reserved = reserved
 
 
 class FakeNvml:
@@ -43,7 +44,19 @@ class FakeNvml:
     NVML_CLOCK_SM = 1
     NVML_TEMPERATURE_GPU = 0
 
-    def __init__(self, *, count: int = 1, init_error: Exception | None = None) -> None:
+    #: v2 内存查询的版本常量（仅 support_v2=True 的实例才在 __init__ 里挂上此属性，
+    #: 与真实 pynvml「新版才有 nvmlMemory_v2」的行为一致）。
+    _V2_SENTINEL = object()
+
+    def __init__(
+        self,
+        *,
+        count: int = 1,
+        init_error: Exception | None = None,
+        support_v2: bool = False,
+        reserved_bytes: int = 0,
+        v2_error: Exception | None = None,
+    ) -> None:
         self.count = count
         self.init_error = init_error
         #: 置上后 nvmlDeviceGetCount 抛异常，用来模拟 NVML 运行期中途失效
@@ -52,9 +65,18 @@ class FakeNvml:
         self.missing: set[str] = set()
         #: 型号名返回 str 而不是 bytes（新版 nvidia-ml-py 的行为）
         self.name_as_str = False
+        #: 驱动 / 硬件保留显存字节；v1 计进 used，v2 单列 reserved 且从 used 剔除
+        self.reserved_bytes = reserved_bytes
+        #: 置上后 v2 查询抛异常，用来验证「v2 失败 → 回退 v1」
+        self.v2_error = v2_error
+        #: nvmlDeviceGetMemoryInfo 每次拿到的 version 参数（None 表示 v1 调用）
+        self.memory_versions: list[object] = []
         self.init_calls = 0
         self.shutdown_calls = 0
         self.count_calls = 0
+        #: 新版 NVML 才暴露 nvmlMemory_v2；老版本没有此属性 → 代码回退 v1
+        if support_v2:
+            self.nvmlMemory_v2 = self._V2_SENTINEL
 
     def nvmlInit(self) -> None:
         self.init_calls += 1
@@ -74,9 +96,20 @@ class FakeNvml:
         self._guard("name")
         return "NVIDIA GeForce RTX 4090" if self.name_as_str else b"NVIDIA GeForce RTX 4090"
 
-    def nvmlDeviceGetMemoryInfo(self, handle: int) -> _MemInfo:
+    def nvmlDeviceGetMemoryInfo(self, handle: int, version: object = None) -> _MemInfo:
         self._guard("memory")
-        return _MemInfo(used=(20 - handle) * GIB, total=24 * GIB)
+        self.memory_versions.append(version)
+        v1_used = (20 - handle) * GIB  # v1 口径：含驱动 / 硬件保留显存
+        if version is not None:  # v2 查询
+            if self.v2_error is not None:
+                raise self.v2_error
+            # v2 把保留显存单列成 reserved 并从 used 中剔除（与任务管理器一致）
+            return _MemInfo(
+                used=v1_used - self.reserved_bytes,
+                total=24 * GIB,
+                reserved=self.reserved_bytes,
+            )
+        return _MemInfo(used=v1_used, total=24 * GIB, reserved=self.reserved_bytes)
 
     def nvmlDeviceGetClockInfo(self, handle: int, clock_type: int) -> int:
         self._guard("clock")
@@ -608,6 +641,86 @@ class TestPsutilCollection:
 # ---------------------------------------------------------------------------
 # make_vram_reader：与 core/process.py 的 VramReader 对接
 # ---------------------------------------------------------------------------
+
+
+class TestNvmlMemoryV2:
+    """NVML 显存查询优先 v2 口径（保留显存不计入 used，与任务管理器 / nvidia-smi 一致）。
+
+    背景（本机实测）：v1 nvmlDeviceGetMemoryInfo 把约 428 MiB 驱动 / 硬件保留显存计进
+    used，导致「已用」比任务管理器虚高约 0.4 GiB、空余同量低估，把临界配置误判为不足。
+    v2 单列 reserved 并从 used 剔除。缺 v2 支持时回退 v1。
+    """
+
+    MIB = 1024 * 1024
+
+    def test_v2_excludes_reserved_from_used(self):
+        """支持 v2 时：used 不含保留显存，读数与任务管理器一致。"""
+        reserved = 428 * self.MIB
+        nvml = FakeNvml(support_v2=True, reserved_bytes=reserved)
+        gpu = make_service(nvml_module=nvml).poll().gpus[0]
+        # v1 会读到 20 GiB；v2 剔除 428 MiB 保留区
+        assert gpu.mem_used_bytes == 20 * GIB - reserved
+        assert gpu.mem_total_bytes == 24 * GIB
+        # 确实走了 v2（每次查询都带 v2 版本常量）
+        assert nvml.memory_versions and all(
+            v is FakeNvml._V2_SENTINEL for v in nvml.memory_versions
+        )
+
+    def test_v1_fallback_when_no_v2_attr(self):
+        """老 NVML 无 nvmlMemory_v2 属性 → 回退 v1，used 含保留显存（现状不变）。"""
+        nvml = FakeNvml(reserved_bytes=428 * self.MIB)  # support_v2=False
+        gpu = make_service(nvml_module=nvml).poll().gpus[0]
+        assert gpu.mem_used_bytes == 20 * GIB  # v1 口径，含保留
+        # 全部走 v1 调用：每次 version 参数都是 None（used / total 各查一次）
+        assert nvml.memory_versions and all(v is None for v in nvml.memory_versions)
+
+    def test_v2_error_falls_back_to_v1(self):
+        """v2 查询抛异常（老驱动不认版本号）→ 回退 v1，不崩、不返回 None。"""
+        nvml = FakeNvml(
+            support_v2=True,
+            reserved_bytes=428 * self.MIB,
+            v2_error=RuntimeError("Function Not Found"),
+        )
+        gpu = make_service(nvml_module=nvml).poll().gpus[0]
+        assert gpu.mem_used_bytes == 20 * GIB  # 回退到 v1 口径
+        assert gpu.mem_total_bytes == 24 * GIB
+
+    def test_v2_frees_up_reserved_in_derived_free(self):
+        """预检的空余按 (total-used) 反推：v1 把保留区当占用压低空余，v2 剔除后空余
+        多出正好一个 reserved——这正是临界误判被修正的那部分显存。"""
+        reserved = 428 * self.MIB
+        v1 = make_service(nvml_module=FakeNvml(reserved_bytes=reserved)).poll().gpus[0]
+        v2 = make_service(
+            nvml_module=FakeNvml(support_v2=True, reserved_bytes=reserved)
+        ).poll().gpus[0]
+        v1_free = v1.mem_total_bytes - v1.mem_used_bytes
+        v2_free = v2.mem_total_bytes - v2.mem_used_bytes
+        assert v2_free - v1_free == reserved
+
+
+class TestNvmlModuleAccessor:
+    """MonitorService.nvml_module 访问器：供 gpu_processes 复用同一 NVML 句柄（不二次 nvmlInit）。"""
+
+    def test_none_before_first_poll(self):
+        svc = make_service(nvml_module=FakeNvml())
+        assert svc.nvml_module is None
+
+    def test_returns_module_after_nvml_poll(self):
+        nvml = FakeNvml()
+        svc = make_service(nvml_module=nvml)
+        svc.poll()
+        assert svc.nvml_module is nvml
+
+    def test_none_when_fell_back_to_smi(self):
+        svc = make_service(smi_runner=FakeSmi())
+        svc.poll()
+        assert svc.backend is MonitorSource.NVIDIA_SMI
+        assert svc.nvml_module is None
+
+    def test_none_when_unavailable(self):
+        svc = make_service(smi_runner=FakeSmi(error=OSError("no")))
+        svc.poll()
+        assert svc.nvml_module is None
 
 
 class TestMakeVramReader:

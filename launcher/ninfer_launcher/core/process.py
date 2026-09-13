@@ -46,6 +46,7 @@ from .process_control import (
     process_terminated,
     VramSettleWatcher,
     settle_vram,
+    stop_external_sync,
     VramReader,
 )
 
@@ -76,6 +77,7 @@ __all__ = [
     "process_terminated",
     "VramSettleWatcher",
     "settle_vram",
+    "stop_external_sync",
     "ServerProcess",
     "ExternalProcessStopper",
 ]
@@ -102,7 +104,7 @@ class ServerProcess(QObject):
         vram_reader: VramReader | None = None,
         killer: Killer | None = None,
         hard_terminator: Callable[[int], tuple[bool, str]] | None = None,
-        alive_check: Callable[[int | None], bool] | None = None,
+        terminated_check: Callable[[int | None], bool] | None = None,
         terminate_grace: float = TERMINATE_GRACE_SECONDS,
         kill_escalation: float = KILL_ESCALATION_SECONDS,
         kill_check_interval_ms: int = KILL_CHECK_INTERVAL_MS,
@@ -118,7 +120,7 @@ class ServerProcess(QObject):
         self._vram_reader = vram_reader
         self._killer = killer or run_taskkill
         self._hard_terminator = hard_terminator or terminate_process_hard
-        self._alive_check = alive_check or process_terminated
+        self._terminated_check = terminated_check or process_terminated
         self._terminate_grace = terminate_grace
         self._kill_escalation = kill_escalation
         self._kill_check_interval_ms = kill_check_interval_ms
@@ -205,7 +207,13 @@ class ServerProcess(QObject):
         pid = self.pid or self._last_pid
         if pid is None:
             return self.is_process_alive()
-        return self._alive_check(pid)
+        # _terminated_check 语义 True = 进程已不在（与 process_terminated 一致），
+        # 必须取反才是「是否存活」。此前直接 return 未取反：进程活着时 is_alive() 误判为
+        # False，_begin_stop 的 `if not self.is_alive()` 走「子进程已不在运行」分支，
+        # 跳过全部杀进程步骤（terminate→taskkill→强杀），进程永远不会被停止。
+        # 该回归源于 2026-09 process_terminated 返回值修复（见 process_control.py 注释）
+        # 漏改了此处依赖方。pid is None 分支（is_process_alive）语义为 True=活，与之保持一致。
+        return not self._terminated_check(pid)
 
     def tail_error_lines(self) -> tuple[str, ...]:
         server_lines = [line for line in self._tail if line.source.from_server]
@@ -590,8 +598,8 @@ class ExternalProcessStopper(QObject):
     :func:`process_terminated`（OS 层真值）验证，直到进程真死或升级时限（kill_escalation）
     用尽；进程确认死亡后走与 ServerProcess 同源的显存回落等待（VramSettleWatcher）。
 
-    alive_check 语义与 process_terminated 相同：True = 进程已不在。全部外部 I/O 可注入
-    （killer / hard_terminator / alive_check / vram_reader / 各时间参数 / clock），
+    terminated_check 语义与 process_terminated 相同：True = 进程已不在。全部外部 I/O 可注入
+    （killer / hard_terminator / terminated_check / vram_reader / 各时间参数 / clock），
     测试用假件替换后不碰真实进程。
 
     信号：
@@ -610,7 +618,7 @@ class ExternalProcessStopper(QObject):
         vram_reader: VramReader | None = None,
         killer: Killer | None = None,
         hard_terminator: Callable[[int], tuple[bool, str]] | None = None,
-        alive_check: Callable[[int | None], bool] | None = None,
+        terminated_check: Callable[[int | None], bool] | None = None,
         kill_escalation: float = KILL_ESCALATION_SECONDS,
         kill_check_interval_ms: int = KILL_CHECK_INTERVAL_MS,
         settle_timeout: float = VRAM_SETTLE_TIMEOUT_SECONDS,
@@ -624,7 +632,7 @@ class ExternalProcessStopper(QObject):
         self._pid = int(pid)
         self._killer = killer or run_taskkill
         self._hard_terminator = hard_terminator or terminate_process_hard
-        self._alive_check = alive_check or process_terminated
+        self._terminated_check = terminated_check or process_terminated
         self._kill_escalation = kill_escalation
         self._clock = clock
         self._watcher = VramSettleWatcher(
@@ -663,14 +671,14 @@ class ExternalProcessStopper(QObject):
             return False
         self._killing = True
         self._watcher.begin()
-        if self._alive_check(self._pid):
+        if self._terminated_check(self._pid):
             self._note("进程（PID %d）已不在运行，直接走停止收尾" % self._pid)
             self._begin_settle_async()
             return True
         self._note("正在停止外部服务（PID %d）…" % self._pid)
         ok, detail = self._killer(self._pid)
         self._note(detail)
-        if self._alive_check(self._pid):
+        if self._terminated_check(self._pid):
             self._begin_settle_async()
         else:
             self._kill_deadline = self._clock() + self._kill_escalation
@@ -686,7 +694,7 @@ class ExternalProcessStopper(QObject):
         if not self._killing:
             self._kill_timer.stop()
             return
-        if self._alive_check(self._pid):
+        if self._terminated_check(self._pid):
             self._kill_timer.stop()
             self._begin_settle_async()
             return

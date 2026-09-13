@@ -34,7 +34,7 @@ main.py                      入口：QApplication + 装 Qt 内置简体中文�
     │   └── builder.py       值字典 → 命令行 list[str]（纯函数）
     └── ui/                  PySide6 界面层
         ├── main_window.py   ★ 唯一持有 ServerProcess/HealthPoller/ConfigStore 的编排中枢
-        ├── control_panel.py 控制面板（通用设置/预设组/服务器控制/响应式双列）
+        ├── control_panel.py 控制面板（通用设置/预设组/服务器控制/显存预检/资源监视/响应式双列）
         ├── params_tab.py    参数面板（registry 驱动生成控件 + 搜索 + 高亮 + 联动）
         ├── widgets.py       通用控件库（Bool3CheckBox / NullableSpinBox / Highlighted* / FlagLabel）
         ├── gpu_power_switch.py 「性能模式」开关控件
@@ -262,7 +262,7 @@ _resolve_exe 三级优先级（修过一个真实 bug：只读 settings.exe_path
 
 ### 4.2 control_panel.py —— 控制面板
 
-响应式布局：宽度 ≥860 px 双列（左=通用设置+预设，右=服务器控制+资源监视），<860 px 竖排单列（resizeEvent 里重排）。
+响应式布局：宽度 ≥860 px 双列（左=通用设置+预设+服务器控制，右=显存预检+资源监视），<860 px 竖排单列（resizeEvent 里重排）。
 
 - 通用设置组：主题下拉（深色/浅色/跟随系统）、性能模式开关（GpuPowerSwitch）、Exe 路径（编辑框+浏览）、模型文件（下拉+浏览，扫描 model_dir/*.ninfer）、端口（SpinBox 1~65535）；
 - _auto_detect（构造期执行）：自动填 build-ninja/apps/ninfer-serve.exe；若 launcher/models/ 下有 .ninfer 文件则重建模型下拉并选中第一个（这就是为什么 models/ 目录里的模型会被自动发现）；
@@ -484,8 +484,8 @@ python -m pytest tests -q         :: 跑测试（默认排除 realsystem）
 
 | 文件 | 覆盖对象 | 要点 |
 |---|---|---|
-| test_process.py | ServerProcess 状态机/日志装配/停止 | 注入 fake killer/terminator/alive_check，时间尺度缩小 |
-| test_close_kill.py | 关闭时 CUDA 进程残留回归（2026-09 用户报告的 bug） | 真启 ping.exe 子进程做 OS 真值闭环；模拟「永远杀不死」「先拒后死」「状态失同步」三种场景 |
+| test_process.py | ServerProcess 状态机/日志装配/停止 | 注入 fake killer/terminator/terminated_check，时间尺度缩小 |
+| test_close_kill.py | 关闭时 CUDA 进程残留 + is_alive 语义回归（2026-09 用户报告） | 真启 ping.exe 子进程做 OS 真值闭环；模拟「永远杀不死」「先拒后死」「状态失同步」三种场景；`TestIsAliveSemantics` 钉死 is_alive() 语义（True=活），防 process_terminated 返回值修复漏改取反的回归 |
 | test_gpu_power.py | gpu_power 模块本体 | 用 real_gpu_power_functions fixture 还原真函数，但桩掉 gpu_power._Nvapi，不会碰真实驱动 |
 | test_gpu_power_switch.py / test_control_panel_gpu_power.py | 开关控件与面板集成 | 注入假 reader/writer/probe |
 | test_monitor.py / test_monitor_panel_ui.py | 三级来源判定/CSV 解析/面板渲染 | 注入假 nvml_module/smi_runner/psutil_module |
@@ -535,6 +535,7 @@ python -m pytest tests -m realsystem      :: 真实驱动核对（会读写本�
 | 关闭启动器后任务管理器还有 ninfer-serve.exe | CUDA 进程在 GPU 驱动临界区拒绝终止，15 s 强杀升级时限用尽 | 日志里会有显著警告「仍未退出：请在任务管理器中手动结束它」——照做即可。这是已知平台限制（WDDM 驱动态），代码已做到「宁可带警告也不静默残留」 |
 | 停止后显存迟迟不降 | 显存回落等待超时（TIMEOUT）属正常降级，不影响后续启动 | 日志会显示「等待 3.0 秒仍未见显存回落（降级继续）」；若长期不降多半是驱动问题 |
 | 日志出现「检测到状态失同步」 | 状态机说 stopped 但 OS 探测进程还活着 | 无需处理，代码已强制收回停止流程补杀，这是防御性修复 |
+| 点「停止」后 ninfer-serve.exe 仍占显存、日志反复「外部服务在运行但无法定位其进程（无 PID 登记表）」 | is_alive() 语义曾反转：进程活着时被误判为「已不在运行」，`_begin_stop` 走「子进程已不在运行」分支、跳过全部杀进程步骤（terminate→taskkill→强杀）；GUI 启动又不写 PID 登记表，对账无法兜底 | 已修复（is_alive 取反，2026-09）。若再现：先确认 ninfer-serve.exe 是否残留并手动结束，再复现定位 |
 
 ### 9.3 监视 / 性能模式相关
 

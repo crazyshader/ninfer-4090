@@ -125,6 +125,39 @@ class TestOsTruthPrimitives:
         _cleanup(proc)
 
 
+class TestIsAliveSemantics:
+    """回归钉死 is_alive() 的语义：必须表示「子进程是否存活」（True=活）。
+
+    2026-09 修复 process_terminated 返回值（True=已死）后，ServerProcess.is_alive()
+    的 pid 非 None 分支一度漏改取反，直接 return self._terminated_check(pid)，
+    导致「进程活着时 is_alive() 返回 False」。_begin_stop 的 `if not self.is_alive()`
+    据此走「子进程已不在运行」分支，跳过全部杀进程步骤（terminate→taskkill→强杀），
+    GUI 点「停止」后 ninfer-serve.exe 永远不会被结束（用户报告，2026-09）。
+    本测试用注入的 terminated_check 验证 is_alive 在两态下的真实返回值，防止再次回归。
+    """
+
+    def test_alive_process_returns_true(self):
+        _qapp()
+        # terminated_check 语义 True=已死；返回 False 即「未终止=存活」
+        proc = _make_proc(terminated_check=lambda pid: False)
+        proc._last_pid = 0x1234
+        assert proc.is_alive() is True, "进程存活（terminated_check=False）时 is_alive 必须为 True"
+
+    def test_terminated_process_returns_false(self):
+        _qapp()
+        # terminated_check 返回 True 即「已终止=不在运行」
+        proc = _make_proc(terminated_check=lambda pid: True)
+        proc._last_pid = 0x1234
+        assert proc.is_alive() is False, "进程已死（terminated_check=True）时 is_alive 必须为 False"
+
+    def test_no_pid_falls_back_to_qt_state(self):
+        _qapp()
+        # 无 PID 可查时退回 Qt 缓存：未启动的 QProcess 处于 NotRunning → is_alive=False
+        proc = _make_proc()
+        proc._last_pid = None
+        assert proc.is_alive() is False
+
+
 class TestStopEscalation:
     """停止流程的强杀升级：terminate / taskkill 都失效时的兜底行为。"""
 
@@ -136,7 +169,7 @@ class TestStopEscalation:
         proc = _make_proc(
             killer=lambda pid: (killer_calls.append(pid), (True, f"假 taskkill {pid}"))[1],
             hard_terminator=lambda pid: (hammer_calls.append(pid), (True, f"假强杀 {pid}"))[1],
-            alive_check=lambda pid: True,  # 永远「杀不死」
+            terminated_check=lambda pid: False,  # 永远「不终止」（terminated 语义 False=未终止=一直活着/杀不死）
         )
         _start_ping(app, proc)
         spy = _LogSpy(proc)
@@ -157,19 +190,20 @@ class TestStopEscalation:
         app = _qapp()
         killer_calls: list[int] = []
         hammer_calls: list[int] = []
-        # 硬杀用假替身（不真杀，让 alive_check 成为唯一真值来源），真实 ping 由 _cleanup 收尾
+        # 硬杀用假替身（不真杀，让 terminated_check 成为唯一真值来源），真实 ping 由 _cleanup 收尾
         t0: list[float | None] = [None]
 
-        def fake_alive(pid):
-            """前 0.2 秒「驱动态拒绝终止」，之后「驱动平息、进程真死」。"""
+        def fake_terminated(pid):
+            """terminated 语义（True=已死）：前 0.2 秒「驱动态拒绝终止」（未终止=False），
+            之后「驱动平息、进程真死」（已终止=True）。"""
             if t0[0] is None:
                 t0[0] = time.monotonic()
-            return time.monotonic() - t0[0] < 0.2
+            return time.monotonic() - t0[0] >= 0.2
 
         proc = _make_proc(
             killer=lambda pid: (killer_calls.append(pid), (True, f"假 taskkill {pid}"))[1],
             hard_terminator=lambda pid: (hammer_calls.append(pid), (True, f"假强杀 {pid}"))[1],
-            alive_check=fake_alive,
+            terminated_check=fake_terminated,
         )
         _start_ping(app, proc)
         spy = _LogSpy(proc)
@@ -193,7 +227,7 @@ class TestStopEscalation:
         proc = _make_proc(
             killer=lambda pid: (killer_calls.append(pid), (True, "假 taskkill"))[1],
             hard_terminator=lambda pid: (hammer_calls.append(pid), (True, "假强杀"))[1],
-            alive_check=lambda pid: True,
+            terminated_check=lambda pid: False,
         )
         _start_ping(app, proc)
         proc._state = ServerState.STOPPED  # 人为制造失同步
@@ -232,6 +266,17 @@ def window(monkeypatch, tmp_path):
 
     win = MainWindow()
     yield win
+    # 收尾清理：清掉外部服务观测与残留 stopper，让这里的 close() 不再弹确认框
+    # （测试进程无人点模态框，conftest 护栏会把它变成明确失败）。
+    stopper = win._external_stopper
+    if stopper is not None:
+        for _attr in ("_kill_timer", "_settle_timer"):
+            _timer = getattr(stopper, _attr, None)
+            if _timer is not None:
+                _timer.stop()
+    win._external_stopper = None
+    win._external_stop_in_progress = False
+    win._external_state = None
     win.close()
 
 
@@ -265,3 +310,103 @@ class TestCloseGate:
 
         assert not _stub_confirm_yes, "服务器未在运行：关闭不应弹确认框"
         assert not killer_calls
+
+
+@pytest.fixture
+def _stub_confirm_no(monkeypatch):
+    """offscreen 下不真跑模态框：关闭确认框一律点「否」。"""
+    calls = []
+
+    def fake_question(*args, **kwargs):
+        calls.append(args)
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(fake_question))
+    return calls
+
+
+class TestCloseGateExternal:
+    """closeEvent 门控的外部服务分支（docs/03-close-external-service-leak-fix.md）。
+
+    回归目标：面板显示外部服务在运行（自身进程 STOPPED）时直接关窗，旧实现会跳过
+    全部停止逻辑、把外部 ninfer-serve 遗弃（残留 ~23 GB 显存）。现在必须弹确认、
+    确认后同步杀掉外部实例再放行。
+    """
+
+    def test_close_stops_external_service_with_pid(self, window, _stub_confirm_yes, monkeypatch):
+        proc = window._process
+        proc._state = ServerState.STOPPED
+        monkeypatch.setattr(proc, "is_alive", lambda: False)
+        # 模拟对账识别出的外部 RUNNING 实例（有 PID 登记表）
+        window._external_state = ServerState.RUNNING
+        window._external_pid = 424242
+        window._external_port = 8080
+        window._external_owner = "cli"
+        killer_calls: list[int] = []
+        hammer_calls: list[int] = []
+        checks: list[int | None] = []
+        # OS 真值替身：taskkill 后仍存活（驱动态），第一轮强杀后确认死亡
+        monkeypatch.setattr(
+            "ninfer_launcher.ui.main_window.stop_external_sync",
+            lambda pid, on_message=None: (
+                killer_calls.append(pid),
+                on_message(f"假 taskkill {pid}"),
+                checks.append(pid),
+                hammer_calls.append(pid),
+                on_message("假强杀"),
+                checks.append(pid),
+                True,
+            )[-1],
+        )
+
+        window.close()
+
+        assert killer_calls == [424242], "外部实例必须在关闭时被同步停止"
+        assert hammer_calls == [424242], "taskkill 失效时必须升级强杀"
+        assert len(checks) >= 2, "必须以 OS 真值校验到进程消失"
+        assert _stub_confirm_yes, "外部服务在运行时关闭必须询问确认"
+        assert not window.isVisible(), "确认并停掉外部服务后窗口必须真正关闭"
+
+    def test_close_external_without_pid_only_logs_hint(self, window, _stub_confirm_yes, monkeypatch):
+        proc = window._process
+        proc._state = ServerState.STOPPED
+        monkeypatch.setattr(proc, "is_alive", lambda: False)
+        # /health 通但无 PID 登记表：无法定位进程
+        window._external_state = ServerState.RUNNING
+        window._external_pid = None
+        window._external_port = 8080
+        window._external_owner = "external"
+        killer_calls: list[int] = []
+        hammer_calls: list[int] = []
+        monkeypatch.setattr(
+            "ninfer_launcher.ui.main_window.stop_external_sync",
+            lambda pid, on_message=None: (killer_calls.append(pid), True)[-1],
+        )
+
+        window.close()
+
+        assert not killer_calls, "无 PID 不得代杀（与 _stop_external 行为一致）"
+        assert not hammer_calls
+        log_text = window._log.text()
+        assert "无法定位其进程" in log_text, "无 PID 时必须落提示日志指引用户手动处置"
+        assert not window.isVisible(), "无 PID 的外部服务不得阻断关闭"
+
+    def test_close_external_running_reply_no_ignores(self, window, _stub_confirm_no, monkeypatch):
+        proc = window._process
+        proc._state = ServerState.STOPPED
+        monkeypatch.setattr(proc, "is_alive", lambda: False)
+        window._external_state = ServerState.RUNNING
+        window._external_pid = 424242
+        window._external_owner = "cli"
+        killer_calls: list[int] = []
+        monkeypatch.setattr(
+            "ninfer_launcher.ui.main_window.stop_external_sync",
+            lambda pid, on_message=None: (killer_calls.append(pid), True)[-1],
+        )
+
+        window.show()  # 先让窗口可见：offscreen 下从未 show 过的窗口 isVisible() 恒为 False
+        window.close()
+
+        assert not killer_calls, "用户拒绝退出时不得触发任何停止流程"
+        assert window.isVisible(), "回复「否」必须取消关闭（event.ignore）"
+

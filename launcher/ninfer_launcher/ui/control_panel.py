@@ -1,8 +1,8 @@
 """控制面板：响应式双列布局 + 通用设置组 + 预设组 + 服务器控制组。
 
 布局（宽 >= 860px 双列，窄 < 860px 单列）：
-- 左列：「通用设置」QGroupBox（主题/Exe路径/模型文件/端口）+「预设配置」QGroupBox
-- 右列：「服务器控制」QGroupBox（启动/停止/打开WebUI/显示命令）+ 资源监视面板
+- 左列：「通用设置」QGroupBox（主题/Exe路径/模型文件/端口）+「预设配置」QGroupBox +「服务器控制」QGroupBox
+- 右列：显存预检面板 + 资源监视面板
 
 预设组：单一「当前预设」下拉（全部预设平铺）+ 四按钮
 〔保存配置〕〔另存为〕〔删除〕〔重置默认〕
@@ -38,6 +38,7 @@ from ..core.process import ServerState
 from ..core.monitor import MonitorService
 from .gpu_power_switch import GpuPowerSwitch
 from .monitor_panel import MonitorPanel
+from .preflight_panel import PreflightPanel
 
 __all__ = ["ControlPanel"]
 
@@ -162,7 +163,7 @@ class _PresetGroup(QWidget):
 
 
 class ControlPanel(QWidget):
-    """控制面板：响应式双列 + 通用设置组 + 预设组 + 服务器控制组。
+    """控制面板：响应式双列 + 通用设置组 + 预设组 + 服务器控制组 + 显存预检/资源监视。
 
     信号：
     - start_requested / stop_requested / open_webui_requested
@@ -193,6 +194,14 @@ class ControlPanel(QWidget):
             monitor_service if monitor_service is not None else MonitorService()
         )
         self._monitor_panel = MonitorPanel(service=self._monitor, auto_start=True)
+        # 显存预检面板：只渲染 PreflightVerdict（见 ui/preflight_panel.py 模块头契约），
+        # 数据由 main_window 的预检编排周期灌入；「刷新」按钮发 refresh_requested 信号。
+        self._preflight_panel = PreflightPanel()
+        # 预检门控状态：blocked=True 时「启动」按钮在 STOPPED 态保持禁用（见 set_preflight_blocked）。
+        self._preflight_blocked = False
+        self._preflight_reason = ""
+        # 面板当前显示的状态矩阵（apply_state 维护；构造后等价于 STOPPED 初值）。
+        self._current_state = ServerState.STOPPED
         self._preset_group = _PresetGroup()
         self._theme_combo = QComboBox()
         self._theme_combo.addItems(["深色", "浅色", "跟随系统"])
@@ -251,7 +260,7 @@ class ControlPanel(QWidget):
     # -- 布局 --
 
     def _build_ui(self) -> None:
-        # 左列：通用设置 + 预设
+        # 左列：通用设置 + 预设 + 服务器控制
         self._left = QWidget()
         left_layout = QVBoxLayout(self._left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -288,13 +297,6 @@ class ControlPanel(QWidget):
 
         left_layout.addWidget(general_box)
         left_layout.addWidget(self._preset_group)
-        left_layout.addStretch()
-
-        # 右列：服务器控制 + 资源监视
-        self._right = QWidget()
-        right_layout = QVBoxLayout(self._right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(8)
 
         # 服务器控制组
         server_box = QGroupBox("服务器控制")
@@ -313,8 +315,17 @@ class ControlPanel(QWidget):
             server_grid.addWidget(b2, r, 1)
             server_grid.setColumnStretch(0, 1)
             server_grid.setColumnStretch(1, 1)
-        right_layout.addWidget(server_box)
+        left_layout.addWidget(server_box)
+        left_layout.addStretch()
 
+        # 右列：显存预检 + 资源监视
+        self._right = QWidget()
+        right_layout = QVBoxLayout(self._right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        # 显存预检面板（启动前显存够不够 + 可退出进程建议）
+        right_layout.addWidget(self._preflight_panel)
         # 资源监视面板（含显存进度条）
         right_layout.addWidget(self._monitor_panel)
         right_layout.addStretch()
@@ -433,6 +444,20 @@ class ControlPanel(QWidget):
 
     # -- 状态同步 --
 
+    def set_preflight_blocked(self, blocked: bool, reason: str = "") -> None:
+        """记录显存预检结论（见 core/vram_preflight.PreflightVerdict.can_start）。
+
+        「启动」按钮可用 = 状态机允许（STOPPED）AND 预检放行（未被 blocked）。
+        blocked=True 时 reason 写入按钮 tooltip（说明还差多少 / 退哪些进程）。
+        当前处于 STOPPED 态时立即刷新按钮可用性；其它状态只记标志，
+        待 apply_state 回到 STOPPED 时再生效。
+        """
+        self._preflight_blocked = bool(blocked)
+        self._preflight_reason = reason or ""
+        if self._current_state is ServerState.STOPPED:
+            self._btn_start.setEnabled(not self._preflight_blocked)
+            self._btn_start.setToolTip(self._preflight_reason if self._preflight_blocked else "")
+
     def apply_state(self, state: ServerState, port: int = 8080) -> None:
         """按状态机同步四个按钮的可用性。
 
@@ -440,10 +465,14 @@ class ControlPanel(QWidget):
         - 「打开 WebUI」只在 RUNNING 可用——服务没就绪时 WebUI 必然不可用；
         - 「显示命令」在 STOPPED / STARTING / RUNNING 都可用，仅 STOPPING 禁用
           （停止过程中命令行已无意义，且此时 exe/参数都不该再被查看）；
-        - 「启动」仅 STOPPED 可用；「停止」仅 STARTING / RUNNING 可用。
+        - 「启动」仅 STOPPED 可用，且未被显存预检阻断（set_preflight_blocked）——
+          预检判定显存不足时，STOPPED 态下「启动」保持禁用，阻断原因进 tooltip；
+        - 「停止」仅 STARTING / RUNNING 可用。
         """
+        self._current_state = state
         if state is ServerState.STOPPED:
-            self._btn_start.setEnabled(True)
+            self._btn_start.setEnabled(not self._preflight_blocked)
+            self._btn_start.setToolTip(self._preflight_reason if self._preflight_blocked else "")
             self._btn_stop.setEnabled(False)
             self._btn_webui.setEnabled(False)
             self._btn_cmd.setEnabled(True)
@@ -493,6 +522,9 @@ class ControlPanel(QWidget):
 
     def get_gpu_power_switch(self) -> GpuPowerSwitch:
         return self._gpu_power_switch
+
+    def get_preflight_panel(self) -> PreflightPanel:
+        return self._preflight_panel
 
     def shutdown(self) -> None:
         self._monitor_panel.stop()

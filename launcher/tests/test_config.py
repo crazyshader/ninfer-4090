@@ -17,6 +17,13 @@ from ninfer_launcher.core.config import (
     save_settings,
     delete_preset,
 )
+from ninfer_launcher.core.vram_estimate import (
+    DEFAULT_SAFETY_BYTES,
+    GIB,
+    MIB,
+    SAFETY_MAX_BYTES,
+    SAFETY_MIN_BYTES,
+)
 
 
 class TestSettings:
@@ -38,6 +45,32 @@ class TestSettings:
         (tmp_path / "settings.json").write_text("{invalid json", encoding="utf-8")
         settings = load_settings(tmp_path)
         assert settings.last_preset == ""
+
+    def test_safety_bytes_default(self, tmp_path):
+        """新建 / 缺字段 → 安全垫默认 200 MiB。"""
+        assert Settings().safety_bytes == DEFAULT_SAFETY_BYTES
+        assert load_settings(tmp_path).safety_bytes == DEFAULT_SAFETY_BYTES
+
+    def test_safety_bytes_roundtrip(self, tmp_path):
+        save_settings(tmp_path, Settings(safety_bytes=1 * GIB))
+        assert load_settings(tmp_path).safety_bytes == 1 * GIB
+
+    def test_safety_bytes_clamped_on_load(self, tmp_path):
+        """settings.json 里被改成越界值 → 读入时夹紧到合法范围。"""
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"safety_bytes": 10 * GIB}), encoding="utf-8"
+        )
+        assert load_settings(tmp_path).safety_bytes == SAFETY_MAX_BYTES
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"safety_bytes": 1 * MIB}), encoding="utf-8"
+        )
+        assert load_settings(tmp_path).safety_bytes == SAFETY_MIN_BYTES
+
+    def test_safety_bytes_bad_value_falls_back(self, tmp_path):
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"safety_bytes": "garbage"}), encoding="utf-8"
+        )
+        assert load_settings(tmp_path).safety_bytes == DEFAULT_SAFETY_BYTES
 
 
 class TestPresets:

@@ -346,6 +346,16 @@ class MonitorService:
         """已判定的来源；构造后尚未 poll 过一次时为 None。"""
         return self._backend
 
+    @property
+    def nvml_module(self) -> Any:
+        """已解析并初始化成功的 NVML 模块；未走 NVML 或尚未 poll 过一次时为 None。
+
+        供 core/gpu_processes.py 复用同一 NVML 句柄（进程级显存枚举），避免二次
+        nvmlInit。监控走了 nvidia-smi 回落时这里为 None，调用方会自行 import
+        pynvml 再试一次（NVML 初始化失败与「GPU 整体读数走 smi」是两件独立的事）。
+        """
+        return self._resolved_nvml if self._backend is MonitorSource.NVML else None
+
     def poll(self) -> SystemSnapshot:
         """采集一轮完整数据。永不抛异常。"""
         gpus, messages = self._collect_gpus()
@@ -528,16 +538,34 @@ def _nvml_name(nvml: Any, handle: Any) -> str | None:
     return str(value) if value else None
 
 
+def _nvml_memory_info(nvml: Any, handle: Any) -> Any:
+    """取显存信息，优先 v2 口径（与任务管理器 / nvidia-smi 一致）。
+
+    NVML v1 的 nvmlDeviceGetMemoryInfo 把驱动 / 硬件保留显存（本机实测约 428 MiB）
+    计进 `used`，导致「已用」比任务管理器虚高约 0.4 GiB、空余被同量低估。v2 把这块
+    单列成 `reserved` 不计入 used，used/free 与任务管理器一致。v2 需要新版 NVML +
+    nvmlMemory_v2 常量；缺任一则回退 v1（回退后 used 偏高，但 free 与 v2 基本一致，
+    对「能否装下」的判定无实质影响）。
+    """
+    version = getattr(nvml, "nvmlMemory_v2", None)
+    if version is not None:
+        try:
+            return nvml.nvmlDeviceGetMemoryInfo(handle, version=version)
+        except Exception:  # noqa: BLE001 - 老驱动 / 老 NVML 不支持 v2，回退 v1
+            pass
+    return nvml.nvmlDeviceGetMemoryInfo(handle)
+
+
 def _nvml_memory_used(nvml: Any, handle: Any) -> int | None:
     try:
-        return int(nvml.nvmlDeviceGetMemoryInfo(handle).used)
+        return int(_nvml_memory_info(nvml, handle).used)
     except Exception:  # noqa: BLE001
         return None
 
 
 def _nvml_memory_total(nvml: Any, handle: Any) -> int | None:
     try:
-        return int(nvml.nvmlDeviceGetMemoryInfo(handle).total)
+        return int(_nvml_memory_info(nvml, handle).total)
     except Exception:  # noqa: BLE001
         return None
 

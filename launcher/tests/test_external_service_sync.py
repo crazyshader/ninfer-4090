@@ -90,7 +90,7 @@ def _drive(stopper: ExternalProcessStopper, clock: FakeClock, step: float, ticks
     return finished
 
 
-def _mk_stopper(*, alive_check, killer, hard_terminator, kill_escalation, clock):
+def _mk_stopper(*, terminated_check, killer, hard_terminator, kill_escalation, clock):
     """构造一个 I/O 全假件、时间尺度缩小的 ExternalProcessStopper（测试专用）。
 
     vram_reader=None → 显存回落走降级路径（fallback_wait 即到即收尾），
@@ -101,7 +101,7 @@ def _mk_stopper(*, alive_check, killer, hard_terminator, kill_escalation, clock)
         vram_reader=None,
         killer=killer,
         hard_terminator=hard_terminator,
-        alive_check=alive_check,
+        terminated_check=terminated_check,
         kill_escalation=kill_escalation,
         kill_check_interval_ms=10,
         settle_timeout=1.0,
@@ -237,6 +237,17 @@ def window(monkeypatch, tmp_path):
 
     win = MainWindow()
     yield win
+    # 收尾清理：清掉外部服务观测与残留 stopper，让这里的 close() 不再弹确认框
+    # （测试进程无人点模态框，conftest 护栏会把它变成明确失败）。
+    stopper = win._external_stopper
+    if stopper is not None:
+        for _attr in ("_kill_timer", "_settle_timer"):
+            _timer = getattr(stopper, _attr, None)
+            if _timer is not None:
+                _timer.stop()
+    win._external_stopper = None
+    win._external_stop_in_progress = False
+    win._external_state = None
     win.close()
 
 
@@ -422,12 +433,12 @@ class TestExternalProcessStopper:
             state["alive"] = False
             return (True, "假 taskkill")
 
-        def alive_check(pid):
+        def terminated_check(pid):
             return not state["alive"]  # True = 已死
 
         clock = FakeClock()
         stopper = _mk_stopper(
-            alive_check=alive_check, killer=killer,
+            terminated_check=terminated_check, killer=killer,
             hard_terminator=lambda pid: (True, "假强杀"),
             kill_escalation=10.0, clock=clock,
         )
@@ -448,7 +459,7 @@ class TestExternalProcessStopper:
 
         clock = FakeClock()
         stopper = _mk_stopper(
-            alive_check=lambda pid: False,  # 永远存活（True=已死 的取反）
+            terminated_check=lambda pid: False,  # 永远存活（True=已死 的取反）
             killer=killer, hard_terminator=hard,
             kill_escalation=0.5, clock=clock,
         )
@@ -469,7 +480,7 @@ class TestExternalProcessStopper:
 
         clock = FakeClock()
         stopper = _mk_stopper(
-            alive_check=lambda pid: not state["alive"],  # 已死
+            terminated_check=lambda pid: not state["alive"],  # 已死
             killer=killer,
             hard_terminator=lambda pid: (True, "x"),
             kill_escalation=10.0, clock=clock,
@@ -482,7 +493,7 @@ class TestExternalProcessStopper:
     def test_reentrant_start_is_ignored(self):
         # 重复 start() 被忽略（不会二次杀 / 二次收尾）
         stopper = _mk_stopper(
-            alive_check=lambda pid: True,  # 已死
+            terminated_check=lambda pid: True,  # 已死
             killer=lambda pid: (True, "x"),
             hard_terminator=lambda pid: (True, "x"),
             kill_escalation=10.0, clock=FakeClock(),

@@ -13,6 +13,7 @@ from ninfer_launcher.core.process import (
     can_transition,
     decode_output,
     settle_vram,
+    stop_external_sync,
     taskkill_command,
 )
 
@@ -215,3 +216,104 @@ class TestVramSettle:
         time.sleep(0.15)
         result = watcher.poll()
         assert result.outcome is SettleOutcome.TIMEOUT
+
+
+class TestStopExternalSync:
+    """stop_external_sync：关闭路径的外部实例同步停止升级链（纯函数，全假件注入）。"""
+
+    PID = 987654
+
+    def _fakes(self, *, alive_after_kill, die_at_round=None):
+        """构造一组可编排的假 I/O。
+
+        alive_after_kill: taskkill 之后进程是否仍存活（True=仍活着/杀不死）。
+        die_at_round: 第 N 轮强杀后进程才真死（None=强杀也无效；0=一开始就已死）。
+        taskkill 之前进程一律按存活处理（除非 die_at_round=0 已覆盖）。
+        """
+        killer_calls: list[int] = []
+        hammer_calls: list[int] = []
+        check_calls: list[int | None] = []
+        messages: list[str] = []
+        sleeps: list[float] = []
+        clock_val = [0.0]
+
+        def fake_clock():
+            return clock_val[0]
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            clock_val[0] += seconds
+
+        def fake_terminated(pid):
+            check_calls.append(pid)
+            if die_at_round is not None and len(hammer_calls) >= die_at_round:
+                return True
+            if not killer_calls:
+                return False  # taskkill 之前进程仍存活
+            return not alive_after_kill
+
+        fakes = dict(
+            killer=lambda pid: (killer_calls.append(pid), (True, f"假 taskkill {pid}"))[1],
+            hard_terminator=lambda pid: (hammer_calls.append(pid), (True, f"假强杀 {pid}"))[1],
+            terminated_check=fake_terminated,
+            kill_escalation=1.0,
+            kill_check_interval_ms=100,
+            clock=fake_clock,
+            sleep=fake_sleep,
+            on_message=messages.append,
+        )
+        state = {
+            "killer_calls": killer_calls,
+            "hammer_calls": hammer_calls,
+            "check_calls": check_calls,
+            "messages": messages,
+            "sleeps": sleeps,
+            "clock": clock_val,
+        }
+        return fakes, state
+
+    def test_already_dead_returns_true_without_killing(self):
+        fakes, state = self._fakes(alive_after_kill=True, die_at_round=0)  # terminated_check 恒 True=已死
+        ok = stop_external_sync(self.PID, **fakes)
+        assert ok is True
+        assert not state["killer_calls"], "进程已死：不得再发任何杀命令"
+        assert not state["hammer_calls"]
+        assert any("已不在运行" in m for m in state["messages"])
+
+    def test_missing_pid_is_false(self):
+        fakes, state = self._fakes(alive_after_kill=False)
+        assert stop_external_sync(0, **fakes) is False
+        assert not state["killer_calls"]
+
+    def test_taskkill_suffices(self):
+        """taskkill 后即死：返回 True，不进入强杀升级。"""
+        fakes, state = self._fakes(alive_after_kill=False)
+        ok = stop_external_sync(self.PID, **fakes)
+        assert ok is True
+        assert state["killer_calls"] == [self.PID]
+        assert not state["hammer_calls"], "taskkill 已生效：无需强杀"
+        assert not state["sleeps"], "确认死亡后立即返回，不阻塞等待"
+
+    def test_hard_kill_rounds_until_os_confirms_death(self):
+        """taskkill 失效、第 2 轮强杀后 OS 确认死亡：返回 True，且校验被多次调用。"""
+        fakes, state = self._fakes(alive_after_kill=True, die_at_round=2)
+        ok = stop_external_sync(self.PID, **fakes)
+        assert ok is True
+        assert state["killer_calls"] == [self.PID]
+        assert len(state["hammer_calls"]) == 2, "每轮强杀直到 OS 确认死亡"
+        assert len(state["check_calls"]) >= 3, "OS 真值校验必须贯穿全程（多轮）"
+        assert state["sleeps"], "强杀轮次之间必须按间隔阻塞等待"
+        assert all(s == 0.1 for s in state["sleeps"]), "间隔应取 kill_check_interval_ms"
+        assert not any("仍未退出" in m for m in state["messages"]), "进程已真死：不应出现时限告警"
+
+    def test_deadline_exhausted_returns_false_with_warning(self):
+        """始终杀不死：时限用尽返回 False，on_message 收到显著警告。"""
+        fakes, state = self._fakes(alive_after_kill=True)
+        ok = stop_external_sync(self.PID, **fakes)
+        assert ok is False
+        assert state["killer_calls"] == [self.PID]
+        assert state["hammer_calls"], "时限内必须持续重试强杀"
+        assert state["clock"][0] >= 1.0, "必须推进到升级时限用尽"
+        assert any("仍未退出" in m and "任务管理器" in m for m in state["messages"]), (
+            "时限用尽仍存活必须给出显著警告（含手动处置指引），不能静默残留"
+        )
