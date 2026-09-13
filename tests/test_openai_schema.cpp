@@ -381,11 +381,52 @@ int test_reject_unsupported() {
         throws_api([&] { (void)parse_chat_completion_request(function_call, default_limits()); }),
         "deprecated function_call rejected");
 
-    Json rf               = base;
+    Json rf                = base;
     rf["response_format"] = Json{{"type", "json_object"}};
+    const GenerationRequest json_object_req =
+        parse_chat_completion_request(rf, default_limits());
+    failures += check(json_object_req.response_format.mode == ResponseFormatMode::JsonObject,
+                      "json_object response_format parsed");
     failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(rf, default_limits()); }),
-              "json response_format rejected");
+        check(to_request_options(json_object_req, default_server()).structured_output.mode ==
+                  ninfer::StructuredOutputMode::JsonObject,
+              "json_object response_format reaches Engine options");
+
+    Json rf_schema = base;
+    rf_schema["response_format"] =
+        Json{{"type", "json_schema"},
+             {"json_schema",
+              Json{{"name", "translation_batch"},
+                   {"strict", true},
+                   {"schema", Json{{"type", "object"},
+                                    {"properties", Json{{"translations", Json{{"type", "array"}}}}},
+                                    {"required", Json::array({"translations"})}}}}}};
+    const GenerationRequest json_schema_req =
+        parse_chat_completion_request(rf_schema, default_limits());
+    failures += check(json_schema_req.response_format.mode == ResponseFormatMode::JsonSchema,
+                      "json_schema response_format parsed");
+    failures += check(json_schema_req.response_format.name == "translation_batch",
+                      "json_schema name retained");
+    failures += check(json_schema_req.response_format.strict,
+                      "json_schema strict retained");
+    failures += check(Json::parse(json_schema_req.response_format.schema_json).at("type") ==
+                          "object",
+                      "json_schema body retained");
+    const ninfer::StructuredOutputOptions structured =
+        to_request_options(json_schema_req, default_server()).structured_output;
+    failures += check(structured.mode == ninfer::StructuredOutputMode::JsonSchema,
+                      "json_schema response_format reaches Engine options");
+    failures += check(structured.name == "translation_batch" && structured.strict,
+                      "json_schema Engine metadata retained");
+    failures += check(Json::parse(structured.schema_json).at("type") == "object",
+                      "json_schema Engine body retained");
+
+    Json invalid_rf = base;
+    invalid_rf["response_format"] = Json{{"type", "json_schema"},
+                                          {"json_schema", Json{{"name", "missing_schema"}}}};
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(invalid_rf, default_limits()); }),
+        "json_schema without schema rejected");
 
     Json rf_text               = base;
     rf_text["response_format"] = Json{{"type", "text"}};
@@ -577,6 +618,57 @@ int test_parse_stop_and_max_tokens() {
                          {"n_predict", 128}};
     req               = parse_chat_completion_request(npredict_pos, default_limits());
     failures += check(req.max_tokens == 128 && req.max_tokens_set, "n_predict 128 parsed as max_tokens");
+    return failures;
+}
+
+// Tool calling and structured output are mutually exclusive: the grammar mask would make the
+// injected "</tool_call>" stop string unreachable, and a byte-level stop match inside a JSON
+// string value would cut generation at an unclosed brace.
+int test_tools_and_response_format_rejected() {
+    int failures    = 0;
+    const Json tool = {{"type", "function"},
+                       {"function", Json{{"name", "get_weather"}, {"description", "Fetch weather"}}}};
+    const Json base = {{"model", "m"},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                       {"tools", Json::array({tool})}};
+
+    Json json_object               = base;
+    json_object["response_format"] = Json{{"type", "json_object"}};
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(json_object, default_limits());
+                      }) == "structured_outputs_not_supported",
+                      "tools with json_object response_format rejected");
+
+    Json json_schema               = base;
+    json_schema["response_format"] = Json{
+        {"type", "json_schema"},
+        {"json_schema", Json{{"name", "weather"}, {"schema", Json{{"type", "object"}}}}}};
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(json_schema, default_limits());
+                      }) == "structured_outputs_not_supported",
+                      "tools with json_schema response_format rejected");
+
+    // response_format type text is not a constraint, so it stays compatible with tools.
+    Json text_format               = base;
+    text_format["response_format"] = Json{{"type", "text"}};
+    const GenerationRequest text_req = parse_chat_completion_request(text_format, default_limits());
+    failures += check(!text_req.response_format.constrained(),
+                      "response_format text is unconstrained and accepted with tools");
+    failures += check(to_request_options(text_req, default_server()).stop.strings.size() == 1,
+                      "response_format text keeps the injected tool stop string");
+
+    // tool_choice none disables tool calling, so the constraint channel is free again.
+    Json disabled           = json_schema;
+    disabled["tool_choice"] = "none";
+    const GenerationRequest disabled_req =
+        parse_chat_completion_request(disabled, default_limits());
+    const ninfer::RequestOptions disabled_options =
+        to_request_options(disabled_req, default_server());
+    failures += check(disabled_options.structured_output.mode ==
+                          ninfer::StructuredOutputMode::JsonSchema,
+                      "tool_choice none allows structured output alongside tool definitions");
+    failures += check(disabled_options.stop.strings.empty(),
+                      "tool_choice none injects no stop string to collide with the grammar mask");
     return failures;
 }
 
@@ -909,6 +1001,7 @@ int main() {
     failures += test_parse_tool_history_messages();
     failures += test_parse_stop_and_max_tokens();
     failures += test_tool_call_stop_string_injected();
+    failures += test_tools_and_response_format_rejected();
     failures += test_parse_sampling_carried();
     failures += test_response_serialization();
     failures += test_completion_usage_mapping_and_bounds();

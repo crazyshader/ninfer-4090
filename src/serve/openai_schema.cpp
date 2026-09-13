@@ -459,19 +459,55 @@ void reject_unsupported_features(const Json& body) {
             throw ApiException(std::move(error));
         }
     }
-    if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& fmt  = body.at("response_format");
-        std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
-                               ? fmt.at("type").get<std::string>()
-                               : std::string();
-        if (type != "text") {
-            ApiError error;
-            error.message = "only response_format {type:text} is supported";
-            error.param   = "response_format";
-            error.code    = "response_format_not_supported";
-            throw ApiException(std::move(error));
-        }
+}
+
+void parse_response_format(const Json& body, GenerationRequest& out) {
+    if (!body.contains("response_format") || body.at("response_format").is_null()) { return; }
+    const Json& format = body.at("response_format");
+    if (!format.is_object()) {
+        bad_request("response_format must be an object or null", "response_format");
     }
+    if (!format.contains("type") || !format.at("type").is_string()) {
+        bad_request("response_format.type must be a string", "response_format.type");
+    }
+
+    const std::string type = format.at("type").get<std::string>();
+    if (type == "text") {
+        out.response_format.mode = ResponseFormatMode::Text;
+        return;
+    }
+    if (type == "json_object") {
+        out.response_format.mode = ResponseFormatMode::JsonObject;
+        return;
+    }
+    if (type != "json_schema") {
+        bad_request("response_format.type must be text, json_object, or json_schema",
+                    "response_format.type", "response_format_type_invalid");
+    }
+    if (!format.contains("json_schema") || !format.at("json_schema").is_object()) {
+        bad_request("response_format.json_schema must be an object",
+                    "response_format.json_schema");
+    }
+
+    const Json& definition = format.at("json_schema");
+    if (!definition.contains("name") || !definition.at("name").is_string() ||
+        definition.at("name").get_ref<const std::string&>().empty()) {
+        bad_request("response_format.json_schema.name must be a non-empty string",
+                    "response_format.json_schema.name");
+    }
+    if (!definition.contains("schema") || !definition.at("schema").is_object()) {
+        bad_request("response_format.json_schema.schema must be an object",
+                    "response_format.json_schema.schema");
+    }
+    if (definition.contains("strict") && !definition.at("strict").is_boolean()) {
+        bad_request("response_format.json_schema.strict must be a boolean",
+                    "response_format.json_schema.strict");
+    }
+
+    out.response_format.mode        = ResponseFormatMode::JsonSchema;
+    out.response_format.name        = definition.at("name").get<std::string>();
+    out.response_format.schema_json = definition.at("schema").dump();
+    out.response_format.strict      = definition.value("strict", false);
 }
 
 Json base_chunk(const std::string& id, const std::string& model, std::int64_t created) {
@@ -566,6 +602,24 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_messages(body, out);
     parse_stop(body, out);
     parse_sampling(body, out);
+    parse_response_format(body, out);
+
+    // Tool calling and structured output are mutually exclusive constraint channels.
+    //
+    // They collide in two ways once both reach the Engine. The grammar mask masks out every
+    // token outside the JSON grammar, so the `</tool_call>` special token can never be sampled
+    // and the stop string translate injects for tool-bearing requests becomes unreachable. And
+    // stop-string matching is a plain byte scan that does not know it is inside a JSON string,
+    // so a model that spells `</tool_call>` inside a string value would cut generation at an
+    // unclosed brace, breaking the very grammar guarantee `strict` promises.
+    //
+    // The Responses adapter already rejects structured output outright; rejecting the
+    // combination here keeps the Chat Completions surface from silently degrading instead.
+    if (out.uses_tools() && out.response_format.constrained()) {
+        bad_request("response_format cannot be combined with tools; set tool_choice to 'none' or "
+                    "drop response_format",
+                    "response_format", "structured_outputs_not_supported");
+    }
 
     out.stream = get_bool(body, "stream", false);
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
