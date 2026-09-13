@@ -238,7 +238,34 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
-    options.stop.strings.reserve(request.stop_strings.size());
+    options.stop.strings.reserve(request.stop_strings.size() + 1);
+
+    // Tool-bearing requests stop at the first </tool_call>, keeping the closing tag.
+    //
+    // parse_qwen_tool_call_output is all-or-nothing: anything after the final </tool_call>,
+    // or between two blocks, makes it discard the whole response as plain text, including
+    // blocks that parsed fine. Qwen3.6 drifts from the template often enough for this to
+    // bite (measured ~0.39% of assistant replies on the 27B), and the drift is silent:
+    // clients see a text answer with no tool call and no error.
+    //
+    // Cutting generation at the first closing tag removes two of the three drift classes
+    // outright (trailing text after the call, prose wedged between calls). It cannot help
+    // when the block itself never closes; that case still falls back to text.
+    //
+    // include_in_output must be true or the parser loses the tag it searches for. Declaration
+    // order matters: this entry goes in before the caller's stop strings so that a caller who
+    // also passes "</tool_call>" (which serve maps with include_in_output = false) does not win
+    // the tie: stop_match_precedes breaks equal byte offsets by declaration order.
+    //
+    // Trade-off: a single reply can now carry at most one tool call. Parallel calls in one
+    // reply are truncated after the first. Reasoning output is unaffected (Content channel only).
+    if (request.uses_tools()) {
+        options.stop.strings.push_back(
+            ninfer::StopString{.text              = "</tool_call>",
+                               .channel           = ninfer::OutputChannel::Content,
+                               .include_in_output = true});
+    }
+
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {
             options.stop.strings.push_back(

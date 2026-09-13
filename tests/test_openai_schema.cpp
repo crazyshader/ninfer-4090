@@ -580,6 +580,52 @@ int test_parse_stop_and_max_tokens() {
     return failures;
 }
 
+int test_tool_call_stop_string_injected() {
+    int failures      = 0;
+    const Json tool   = {{"type", "function"},
+                         {"function", Json{{"name", "get_weather"}, {"description", "Fetch weather"}}}};
+    const Json base   = {{"model", "m"},
+                         {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                         {"tools", Json::array({tool})}};
+
+    GenerationRequest req          = parse_chat_completion_request(base, default_limits());
+    ninfer::RequestOptions options = to_request_options(req, default_server());
+    failures += check(options.stop.strings.size() == 1, "tool request gets exactly one stop string");
+    failures += check(options.stop.strings[0].text == "</tool_call>", "injected stop string text");
+    failures += check(options.stop.strings[0].include_in_output,
+                      "injected stop string must keep the closing tag in the output");
+    failures += check(options.stop.strings[0].channel == ninfer::OutputChannel::Content,
+                      "injected stop string applies to the content channel only");
+
+    // The injected entry must be declared first: stop_match_precedes breaks equal byte
+    // offsets by declaration order, so a caller-supplied "</tool_call>" (mapped with
+    // include_in_output = false) would otherwise strip the tag the parser needs.
+    Json with_caller_stop           = base;
+    with_caller_stop["stop"]        = Json::array({"</tool_call>", "STOP"});
+    req                             = parse_chat_completion_request(with_caller_stop, default_limits());
+    options                         = to_request_options(req, default_server());
+    failures += check(options.stop.strings.size() == 3, "caller stop strings are kept alongside");
+    failures += check(options.stop.strings[0].text == "</tool_call>" &&
+                          options.stop.strings[0].include_in_output,
+                      "injected stop string is declared before caller entries");
+    failures += check(options.stop.strings[1].text == "</tool_call>" &&
+                          !options.stop.strings[1].include_in_output,
+                      "caller duplicate is preserved but loses the tie");
+
+    Json disabled           = base;
+    disabled["tool_choice"] = "none";
+    req                     = parse_chat_completion_request(disabled, default_limits());
+    failures += check(to_request_options(req, default_server()).stop.strings.empty(),
+                      "tool_choice none does not inject the stop string");
+
+    const Json no_tools = {{"model", "m"},
+                           {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    req                 = parse_chat_completion_request(no_tools, default_limits());
+    failures += check(to_request_options(req, default_server()).stop.strings.empty(),
+                      "tool-free request does not inject the stop string");
+    return failures;
+}
+
 int test_parse_sampling_carried() {
     int failures                = 0;
     const Json body             = {{"model", "m"},
@@ -862,6 +908,7 @@ int main() {
     failures += test_parse_function_tools_and_choices();
     failures += test_parse_tool_history_messages();
     failures += test_parse_stop_and_max_tokens();
+    failures += test_tool_call_stop_string_injected();
     failures += test_parse_sampling_carried();
     failures += test_response_serialization();
     failures += test_completion_usage_mapping_and_bounds();

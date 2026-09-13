@@ -77,7 +77,7 @@ int test_malformed_falls_back_to_text() {
     return failures;
 }
 
-int test_suffix_after_tool_falls_back_to_text() {
+int test_suffix_after_tool_is_kept_as_content() {
     const std::string text = "<tool_call>\n"
                              "<function=get_weather>\n"
                              "<parameter=city>\nParis\n</parameter>\n"
@@ -87,8 +87,64 @@ int test_suffix_after_tool_falls_back_to_text() {
     const ninfer::serve::ParsedToolCallOutput parsed =
         ninfer::serve::parse_qwen_tool_call_output(text, 64);
     int failures = 0;
-    failures += check(!parsed.is_tool_call_response, "non-whitespace suffix falls back to text");
-    failures += check(parsed.content == text, "suffix fallback preserves text");
+    failures += check(parsed.is_tool_call_response, "suffix no longer voids the parsed call");
+    failures += check(parsed.tool_calls.size() == 1, "call survives a trailing suffix");
+    failures += check(parsed.tool_calls[0].name == "get_weather", "suffix case function name");
+    failures += check(parsed.content == "extra answer", "suffix is kept as content");
+    return failures;
+}
+
+// The drift observed in production: a first block that never closes </function>, prose
+// wedged in between, then a well-formed block. The good block must survive.
+int test_broken_block_then_good_block() {
+    const std::string text = "<tool_call>\n"
+                             "<function=run_code>\n"
+                             "<parameter=code>\nfirst attempt\n</parameter>\n"
+                             "<think>let me retry</think>\n"
+                             "<tool_call>\n"
+                             "<function=run_code>\n"
+                             "<parameter=code>\nsecond attempt\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "good block recovered next to a broken one");
+    failures += check(parsed.tool_calls.size() == 1, "exactly the good block is parsed");
+    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+    failures += check(args.at("code") == "second attempt", "the good block's argument is parsed");
+    failures += check(parsed.content.find("first attempt") != std::string::npos,
+                      "broken block bytes stay observable in content");
+    failures += check(parsed.content.find("<think>let me retry</think>") != std::string::npos,
+                      "text between blocks stays in content");
+    return failures;
+}
+
+int test_malformed_block_between_good_blocks() {
+    const std::string text = "<tool_call>\n"
+                             "<function=first>\n"
+                             "<parameter=a>\n1\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "<tool_call>\n"
+                             "<function=broken>\n"
+                             "stray body with no parameter tags\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "<tool_call>\n"
+                             "<function=third>\n"
+                             "<parameter=c>\n3\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "surrounding blocks survive a bad middle block");
+    failures += check(parsed.tool_calls.size() == 2, "two good blocks parsed");
+    failures += check(parsed.tool_calls[0].name == "first" && parsed.tool_calls[1].name == "third",
+                      "good blocks keep their order");
+    failures += check(parsed.content.find("<function=broken>") != std::string::npos,
+                      "bad middle block bytes stay observable in content");
     return failures;
 }
 
@@ -158,7 +214,9 @@ int main() {
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
     failures += test_malformed_falls_back_to_text();
-    failures += test_suffix_after_tool_falls_back_to_text();
+    failures += test_suffix_after_tool_is_kept_as_content();
+    failures += test_broken_block_then_good_block();
+    failures += test_malformed_block_between_good_blocks();
     failures += test_configured_name_limit();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();

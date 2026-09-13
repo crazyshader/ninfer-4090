@@ -25,12 +25,6 @@ std::string trim_ascii(std::string_view text) {
     return std::string(text.substr(begin, end - begin));
 }
 
-std::string rtrim_ascii(std::string_view text) {
-    std::size_t end = text.size();
-    while (end != 0 && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) { --end; }
-    return std::string(text.substr(0, end));
-}
-
 void skip_ws(std::string_view text, std::size_t& pos) {
     while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])) != 0) { ++pos; }
 }
@@ -129,30 +123,46 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     constexpr std::string_view kToolOpen  = "<tool_call>";
     constexpr std::string_view kToolClose = "</tool_call>";
 
-    const std::size_t first = text.find(kToolOpen);
-    if (first == std::string::npos) { return fallback(text); }
-
     ParsedToolCallOutput out;
-    out.content = rtrim_ascii(std::string_view(text).substr(0, first));
+    std::string outside; // everything that is not a successfully parsed block
 
-    std::size_t pos = first;
-    while (pos < text.size()) {
-        skip_ws(text, pos);
-        if (pos >= text.size()) { break; }
-        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
-        const std::size_t inner_begin = pos + kToolOpen.size();
+    std::size_t cursor = 0;
+    for (;;) {
+        const std::size_t open = text.find(kToolOpen, cursor);
+        if (open == std::string::npos) { break; }
+        const std::size_t inner_begin = open + kToolOpen.size();
         const std::size_t close       = text.find(kToolClose, inner_begin);
-        if (close == std::string::npos) { return fallback(text); }
-        ToolCall call;
-        if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
-                                 max_tool_name_length, call)) {
-            return fallback(text);
+        if (close == std::string::npos) { break; } // unterminated: rest is text
+
+        // A second opening tag before the closing one means this block never closed.
+        // Restart at the inner tag instead of swallowing it as this block's parameters,
+        // which is what the observed "missing </function>" drift produces: a broken block
+        // followed by a well-formed one. Without this the good block would be unreachable.
+        const std::size_t next_open = text.find(kToolOpen, inner_begin);
+        if (next_open != std::string::npos && next_open < close) {
+            outside.append(text, cursor, next_open - cursor);
+            cursor = next_open;
+            continue;
         }
-        out.tool_calls.push_back(std::move(call));
-        pos = close + kToolClose.size();
+
+        const std::size_t block_end = close + kToolClose.size();
+        ToolCall call;
+        if (parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
+                                max_tool_name_length, call)) {
+            outside.append(text, cursor, open - cursor);
+            out.tool_calls.push_back(std::move(call));
+        } else {
+            // Keep the raw block. There is no logger on this path, so leaving the bytes in
+            // content is the only way a malformed block stays observable to the caller
+            // instead of vanishing.
+            outside.append(text, cursor, block_end - cursor);
+        }
+        cursor = block_end;
     }
 
     if (out.tool_calls.empty()) { return fallback(text); }
+    outside.append(text, cursor, std::string::npos);
+    out.content               = trim_ascii(outside);
     out.is_tool_call_response = true;
     return out;
 }

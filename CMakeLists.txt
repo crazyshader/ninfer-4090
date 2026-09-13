@@ -29,6 +29,22 @@ if(MSVC)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
   add_compile_options(
     # MSVC Host C/C++
+    # Sources are UTF-8 without BOM. Without this, cl.exe guesses the host ANSI code page
+    # (936 on a Chinese Windows) and mis-decodes every non-ASCII byte. In comments that only
+    # yields garbled text plus C4819; inside a string literal the stray bytes break the
+    # literal outright (C2001), which is what kept test_frontend.cpp and
+    # test_engine_prefix_real.cpp from compiling.
+    #
+    # /utf-8 sets both source and execution charset. The execution half is required, not
+    # incidental: test_frontend.cpp builds a byte-level BPE vocab out of literals whose bytes
+    # must be the UTF-8 encoding ("a" + "," + "N" standing for E4 B8 AD) and asserts the
+    # decoded output equals a UTF-8 string. Under an ANSI execution charset those literals are
+    # transcoded and the vocab keys stop matching the byte-level tokens.
+    #
+    # Product code is unaffected: no source file under src/ has a non-ASCII string literal
+    # (the non-ASCII bytes there are all in comments), and src/ uses no ANSI code page APIs
+    # (CP_ACP / MultiByteToWideChar / GetACP), so nothing assumed the old narrow encoding.
+    $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:C,CXX>:/EHsc>
     $<$<COMPILE_LANGUAGE:C,CXX>:/O2>
@@ -38,6 +54,7 @@ if(MSVC)
     $<$<COMPILE_LANGUAGE:C,CXX>:/arch:AVX2>
 
     # NVCC Host Pass-through
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/O2>
