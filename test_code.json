@@ -1,0 +1,8 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "用 C++ 实现一个线程安全的 LRU 缓存类 LRUCache，支持 get(key) 和 put(key, value) 两个操作，容量固定，超出容量时淘汰最久未使用的项。要求用 std::list + std::unordered_map 实现 O(1) 复杂度，并用 std::mutex 保证线程安全。给出完整可编译的代码和简要说明。"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "name": "Qwen3.8-27B MTP",
+  "schema": 1,
+  "params": {
+    "model": "E:\\ai\\ninfer-4090\\qwen3_8_27b_8-19.ninfer",
+    "port": 8080,
+    "kv_dtype": "rk4v4-e8",
+    "spec": "mtp",
+    "draft_tokens": 7,
+    "lm_head_draft": "on",
+    "max_context": 163840,
+    "prefill_chunk": 1024,
+    "no_thinking": "off",
+    "reasoning_effort": "low",
+    "vision": "on"
+  }
+}
